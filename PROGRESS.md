@@ -253,34 +253,178 @@ later.
     for squares in `legalTargets`. Confirmed working: selecting a piece
     now visibly lights up its legal destinations.
 
+14. **Real piece images + board flip + last-move highlight.** Downloaded
+    the openly-licensed Cburnett SVG piece set (same one lichess uses;
+    chess.com's own art is proprietary and wasn't used) into
+    `apps/web/public/pieces/` — named `wK.svg`/`bK.svg` etc. (color +
+    uppercase piece letter) specifically to avoid Windows' case-insensitive
+    filesystem treating `K.svg`/`k.svg` as the same file. `pieceImage(piece)`
+    maps a FEN letter to the right file. Board now flips for Black: a
+    `displayIndex = color === "black" ? 63 - index : index` separates
+    "screen position" from "actual board square" — `index` stays a plain
+    0-63 grid position, `displayIndex` is what actually gets looked up in
+    `board`/`squareName`. Checkerboard coloring still uses plain `index`
+    unchanged, since a 180° flip preserves the light/dark parity. Added a
+    translucent yellow overlay on `gameState.lastMove.from`/`.to` — hit and
+    fixed a CSS stacking issue where the overlay (being `position: absolute`)
+    painted over the piece image regardless of DOM order; fixed by giving
+    the piece image its own `relative z-10` so it wins the stacking order.
+
+15. **Copy Game ID button.** `navigator.clipboard.writeText(gameId)`,
+    with a brief "Copied!" flash via a `copied` state + `setTimeout`.
+    Iterated to an icon-button version (inline SVG clipboard/checkmark,
+    `aria-label` for accessibility) instead of text, on request.
+
+16. **Built the full clock/timer system**, spanning all three packages:
+    - `packages/chess`: `ChessGame` gained `whiteTimeMs`/`blackTimeMs`/
+      `lastMoveAt` fields, a `"waiting"` initial `GameStatus` (only becomes
+      `"active"` via a new `start()` method — this was needed to fix a
+      real bug where the clock visibly ticked down during the wait for an
+      opponent, since `getState()` always returned a real `lastMoveAt`),
+      `move()` now deducts elapsed time from whoever's turn it was
+      *before* the move (captured before `chess.js`'s call flips the
+      turn, deduction happens only *after* the move succeeds — so a
+      failed illegal-move attempt never double-counts time), and a
+      `flagTimeout(color)` method (same shape as `resign`) for ending the
+      game on time.
+    - `apps/server`: rather than polling every game, one `setTimeout` per
+      room is scheduled for exactly when the current player's clock would
+      hit zero (`scheduleTimeoutCheck`), and **rescheduled** (old one
+      `clearTimeout`'d) on every move — matching how production chess
+      engines actually do it, not a naive interval loop. Scheduled only
+      once Black joins (`room.game.start()`), not at room creation, so
+      White isn't penalized for however long they wait for an opponent.
+      Cancelled on resignation so a stale timer can't fire after the game
+      already ended a different way.
+    - `apps/web`: a `now` state ticking every 250ms via `setInterval`
+      purely to force re-renders (the value itself is meaningless — its
+      only job is to make React recompute the display); `displayTime(color)`
+      interpolates the *shown* time locally between real server updates by
+      subtracting elapsed time from the last known snapshot, without ever
+      touching the authoritative value itself. `ClockBar` renders each
+      side's clock, highlighting whoever's actually on the clock.
+    - Later made the starting time and enable/disable a **shared room
+      setting** rather than a personal per-browser toggle (a real design
+      question: `useState` is per-tab, so a personal checkbox couldn't
+      possibly affect the opponent's screen) — `ClientMessage`'s
+      `create_game` now carries `timeControl: number` (minutes, `0` means
+      no limit), echoed back in every relevant `ServerMessage` so both
+      players' clients agree. `ChessGame`'s constructor takes an optional
+      `startingTimeMs` parameter instead of a hardcoded 5 minutes.
+      `scheduleTimeoutCheck`/`scheduleComputerTimeoutCheck` both short-circuit
+      when `timeControl === 0`, and `setTimeout(fn, Infinity)` was
+      deliberately avoided (unreliable across engines) in favor of simply
+      never scheduling anything for unlimited games.
+
+17. **Play vs Computer, using Stockfish compiled to WebAssembly.**
+    Deliberately chosen to run **client-side** in a Web Worker (matching
+    lichess's approach) rather than as a server subprocess (chess.com's
+    proprietary approach) — a local human-vs-engine game has no second
+    remote player to synchronize, so the server's whole reason for
+    existing doesn't apply here.
+    - Installed `stockfish` (npm), inspected its actual `bin/` contents
+      directly rather than guessing filenames, and copied the
+      single-threaded "lite" build (`stockfish-18-lite-single.js` + `.wasm`,
+      ~7MB) into `apps/web/public/stockfish/` — chosen specifically to
+      avoid the multi-threaded build's requirement for COOP/COEP HTTP
+      headers (SharedArrayBuffer support), a configuration rabbit hole
+      avoided entirely.
+    - Learned and used the **UCI protocol** (plain text lines over
+      `postMessage`/`onmessage`): `"uci"` (handshake, ends `uciok`),
+      `"position fen ..."`, `"go depth 12"` (replies `bestmove e2e4`, or
+      `bestmove e7e8q` for a promotion — parsed via `.slice(0,2)`/`.slice(2,4)`/
+      5th character).
+    - `getComputerMove(fen)` wraps this callback/event-based API in a
+      `new Promise` (the correct tool for bridging an event listener into
+      something `await`-able — `async`/`await` alone can't do this, it's
+      for *consuming* an existing promise, not creating one from a raw
+      event API).
+    - Verified engine strength empirically rather than assuming:
+      `Skill Level` alone appeared to have no real effect (`UCI_LimitStrength`
+      defaults to `false`, its own "master switch"); switched to the
+      correct pair — `setoption name UCI_LimitStrength value true` +
+      `setoption name UCI_Elo value <1320-3190>` — Stockfish's own
+      purpose-built mechanism for human-like difficulty. `1320` is the
+      engine's real documented floor. Added a custom **"Very Easy"** mode
+      below that floor: 40% of the time, ignore the engine and play a
+      uniformly random legal move instead (`ChessGame.allLegalMoves()`,
+      a new method mirroring `legalMoves` but for the whole board).
+    - `makeLocalMove` mirrors the server's own `move` handler almost
+      exactly (`try { game.move(...) } catch { ... }`) — same `ChessGame`
+      class, just called directly instead of over a socket. `mode: "multiplayer" | "computer"`
+      state branches `handleSquareClick`/`handleResign`/clock-scheduling
+      between the WebSocket path and this local path throughout.
+
+18. **Pawn promotion UI.** A real bug: neither multiplayer nor computer
+    moves ever sent a `promotion` field for the *human's* half of a move
+    (only the engine's replies included one), so `chess.js` rejected
+    promotion attempts as invalid. Fixed with `squareToIndex` (inverse of
+    `squareName`), `isPromotion(from, to)` (checks the moving piece is a
+    pawn reaching the far rank), and a `pendingPromotion` state that pauses
+    the move and shows a Queen/Rook/Bishop/Knight picker before actually
+    calling `submitMove(from, to, promotion)`.
+
+19. **UI redesign with Tailwind CSS** (already installed by `create-next-app`,
+    just unused until now — no new setup needed). Converted from inline
+    `style={{...}}` objects to utility classes; chess.com-style dark theme
+    (`#302e2b` background, `#81b64c` green buttons), bigger board (64px
+    squares), opponent's clock above / yours below the board (computed via
+    `color`, so it's correct regardless of which side you're playing).
+    Learned arbitrary-value classes (`bg-[#eeeed2]`, `grid-cols-[repeat(8,64px)]`)
+    and opacity modifiers (`bg-black/20`). Hit and fixed a real paste bug
+    where new JSX landed *inside* the old board's `.map()` callback instead
+    of replacing the whole `return`, causing a "missing key" warning
+    (React was rendering the whole page once per board square).
+
+20. **"New Game" button** — `gameState` never went back to `undefined`
+    after a game ended, so there was no way back to the landing screen
+    without a full page refresh. `resetGame()` clears `gameState`,
+    `gameId`, `color`, `selected`, `error`, `pendingPromotion`, the local
+    `ChessGame` ref, and any pending computer-mode timeout — shown
+    alongside the Game Over message.
+
+21. **Confetti on win** — `canvas-confetti` (a small library, same
+    "reuse instead of reinventing" reasoning as `chess.js`), fired once
+    via a `useEffect` keyed on `[gameState?.status, gameState?.winner, color]`
+    only when `gameState.winner === color` (so only the winner's browser
+    celebrates; a draw's `winner === null` never matches either side).
+
+22. **Committed and pushed to GitHub.** Discovered the repo had only ever
+    had one commit (the initial `.gitignore`) despite everything above
+    being built — staged and committed the whole project, created a
+    GitHub repository, added it as `origin`, pushed `main`.
+
 ## Current repo state
 
 ```
 apps/
-  server/   Complete and tested. package.json, tsconfig.json,
-            src/server.ts (full WebSocket server, all 4 message types),
-            src/test-client.ts (two-socket test script).
-  web/      Complete and tested. Next.js app, single page
-            (app/page.tsx): connects, create/join UI, renders the board
-            from FEN, click-to-move, all typed against @repo/protocol.
+  server/   Complete. Full WebSocket server: create/join/move/resign,
+            server-authoritative clock with per-room scheduled timeouts,
+            configurable time control.
+  web/      Complete. Next.js app (app/page.tsx): multiplayer + local
+            Play-vs-Computer (Stockfish/WASM) modes, full board with
+            real piece images, flip-for-Black, legal-move and last-move
+            highlighting, promotion picker, live clocks, confetti,
+            Tailwind dark theme, New Game reset.
 packages/
-  chess/      @repo/chess — ChessGame class finished and typechecking
-  protocol/   @repo/protocol — shared ClientMessage/ServerMessage types
+  chess/      @repo/chess — ChessGame: rules, clock, timeout/resign,
+              legalMoves/allLegalMoves.
+  protocol/   @repo/protocol — shared ClientMessage/ServerMessage types,
+              including timeControl.
   eslint-config/       from create-turbo, untouched
   typescript-config/   from create-turbo, untouched (shared base.json)
 ```
 
-The core app is functionally complete and working: two players can create
-a room, join it, and play a full game of chess against each other through
-the browser.
+The app is feature-complete for a v1: two players can create a room with
+a chosen time control (or none), play a full timed game, or a single
+player can play against Stockfish at an adjustable difficulty — all with
+promotion, resign, and a working clock.
 
 ## Next step (not done yet)
 
-No fixed next step right now — create/join/move/resign, and legal-move
-highlighting, are all done and working. Remaining possible directions:
-clean up leftover debug `console.log`s and the raw JSON state dump in
-`page.tsx`; handle checkmate/draw/resignation end states visually instead
-of just raw status text (and stop allowing further clicks once the game
-is over); pawn promotion UI (the server accepts a `promotion` field,
-nothing sends one yet); move `pieceSymbols`/`boardFromFen`/`squareName`
-back outside the component so they aren't recreated every render.
+No fixed next step. Known, deliberately-scoped-out gaps for a possible v2:
+no draw-offer button (draws only happen via actual chess rules); no
+reconnect handling if a connection drops mid-game (the room is simply
+orphaned); no move-history/PGN panel; `ws://localhost:3001` is hardcoded,
+not yet an environment variable (would need to be before any real
+deployment); no rematch/spectator/chat/sound features.
